@@ -15,8 +15,8 @@ import cv2
 import mlflow
 import pandas as pd
 
-from Metrics.brisque_metric import compute_brisque
-from Metrics.niqe_metric import compute_niqe
+from Metrics.brisque_metric import BRISQUEMetric
+from Metrics.niqe_metric import NIQEMetric
 from Metrics.piqe_metric import compute_piqe
 from Preprocessing.SimpleWB import apply_simple_wb
 
@@ -64,17 +64,39 @@ def list_condition_dirs(dataset_root: Path) -> List[Path]:
 def list_images(condition_dir: Path) -> List[Path]:
     return sorted(
         [
-            p for p in condition_dir.iterdir()
+            p
+            for p in condition_dir.iterdir()
             if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
         ]
     )
 
 
-def compute_metrics(image_bgr) -> Dict[str, float]:
+def bgr_to_rgb_uint8(image_bgr):
+    if image_bgr is None:
+        raise ValueError("image_bgr es None")
+
+    if not hasattr(image_bgr, "ndim") or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            f"Se esperaba imagen BGR HxWx3, recibido shape={getattr(image_bgr, 'shape', None)}"
+        )
+
+    if image_bgr.dtype != "uint8":
+        image_bgr = image_bgr.astype("uint8")
+
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+
+def compute_metrics(
+    image_bgr,
+    niqe_metric: NIQEMetric,
+    brisque_metric: BRISQUEMetric,
+) -> Dict[str, float]:
+    image_rgb = bgr_to_rgb_uint8(image_bgr)
+
     return {
-        "niqe": float(compute_niqe(image_bgr)),
-        "brisque": float(compute_brisque(image_bgr)),
-        "piqe": float(compute_piqe(image_bgr)),
+        "niqe": float(niqe_metric.score(image_rgb)),
+        "brisque": float(brisque_metric.score(image_rgb)),
+        "piqe": float(compute_piqe(image_rgb)),
     }
 
 
@@ -107,13 +129,18 @@ def main() -> None:
 
     condition_dirs = list_condition_dirs(dataset_root)
     if not condition_dirs:
-        raise FileNotFoundError(f"No se encontraron carpetas de condición en: {dataset_root}")
+        raise FileNotFoundError(
+            f"No se encontraron carpetas de condición en: {dataset_root}"
+        )
 
     clip_values = [0, 1, 2, 5]
     preserve_values = [True, False]
     gain_values = [1.2, 1.5, 2.0]
 
     all_run_rows = []
+
+    niqe_metric = NIQEMetric()
+    brisque_metric = BRISQUEMetric()
 
     for condition_dir in condition_dirs:
         condition_name = condition_dir.name
@@ -159,7 +186,11 @@ def main() -> None:
                         channel_gain_limit=channel_gain_limit,
                     )
 
-                    metrics = compute_metrics(processed_bgr)
+                    metrics = compute_metrics(
+                        processed_bgr,
+                        niqe_metric=niqe_metric,
+                        brisque_metric=brisque_metric,
+                    )
 
                     row = {
                         "condition": condition_name,
