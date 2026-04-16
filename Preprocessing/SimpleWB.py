@@ -31,7 +31,7 @@ def simple_wb(
     channel_gain_limit: float = 2.0,
 ) -> np.ndarray:
     if image_bgr is None or image_bgr.size == 0:
-        raise ValueError('Imagen vacia o invalida.')
+        raise ValueError("Imagen vacia o invalida.")
 
     image = image_bgr.astype(np.float32)
     original_mean = float(np.mean(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)))
@@ -62,6 +62,20 @@ def simple_wb(
     return out.astype(np.uint8)
 
 
+def apply_simple_wb(
+    image_bgr: np.ndarray,
+    clip_percent: float,
+    preserve_luminance: bool,
+    channel_gain_limit: float,
+) -> np.ndarray:
+    return simple_wb(
+        image_bgr=image_bgr,
+        clip_percent=clip_percent,
+        preserve_luminance=preserve_luminance,
+        channel_gain_limit=channel_gain_limit,
+    )
+
+
 def process_image(
     input_path: Union[str, Path],
     output_path: Union[str, Path],
@@ -73,7 +87,7 @@ def process_image(
     output_path = Path(output_path)
     image = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
     if image is None:
-        raise FileNotFoundError(f'No se pudo leer la imagen: {input_path}')
+        raise FileNotFoundError(f"No se pudo leer la imagen: {input_path}")
 
     processed = simple_wb(
         image_bgr=image,
@@ -84,5 +98,5 @@ def process_image(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ok = cv2.imwrite(str(output_path), processed)
     if not ok:
-        raise IOError(f'No se pudo guardar la imagen procesada: {output_path}')
+        raise IOError(f"No se pudo guardar la imagen procesada: {output_path}")
     return output_path
