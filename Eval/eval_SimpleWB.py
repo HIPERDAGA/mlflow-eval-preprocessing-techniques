@@ -1,20 +1,5 @@
 from __future__ import annotations
 
-import argparse
-import itertools
-import os
-import tempfile
-from pathlib import Path
-from typing import Iterable
-
-import mlflow
-import pandas as pd
-from PIL import Image
-from tqdm import tqdm
-
-
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 
@@ -24,188 +9,259 @@ if str(ROOT) not in sys.path:
 
 import argparse
 import itertools
-import os
 from typing import Dict, List
 
 import cv2
 import mlflow
-import numpy as np
 import pandas as pd
-
 
 from Metrics.brisque_metric import compute_brisque
 from Metrics.niqe_metric import compute_niqe
 from Metrics.piqe_metric import compute_piqe
-from Preprocessing.SimpleWB import process_image
+from Preprocessing.SimpleWB import apply_simple_wb
 
 
-
-
-CONDITIONS = [
-    'fog_day', 'fog_night', 'fog_twilight',
-    'rain_day', 'rain_night', 'rain_twilight',
-    'sand_day', 'sand_night', 'sand_twilight',
-    'snow_day', 'snow_night', 'snow_twilight',
-]
-
-
-def list_images(folder: Path) -> list[Path]:
-    valid_ext = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
-    return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in valid_ext])
-
-
-def save_example_artifacts(original_path: Path, processed_path: Path, output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    Image.open(original_path).save(output_dir / f'original__{original_path.name}')
-    Image.open(processed_path).save(output_dir / f'processed__{processed_path.name}')
-
-
-def run_condition(
-    dataset_root: Path,
-    condition: str,
-    clip_percent: float,
-    preserve_luminance: bool,
-    channel_gain_limit: float,
-    experiment_name: str,
-) -> dict:
-    condition_dir = dataset_root / condition
-    images = list_images(condition_dir)
-    if not images:
-        raise FileNotFoundError(f'No se encontraron imagenes en {condition_dir}')
-
-    mlflow.set_experiment(experiment_name)
-    run_name = (
-        f'{condition}__simple_wb__clip_{clip_percent}'
-        f'__pl_{str(preserve_luminance).lower()}__cgl_{channel_gain_limit}'
-    )
-
-    with mlflow.start_run(run_name=run_name):
-        mlflow.log_params({
-            'condition': condition,
-            'technique': 'white_balance',
-            'method': 'simple_wb',
-            'clip_percent': clip_percent,
-            'preserve_luminance': preserve_luminance,
-            'channel_gain_limit': channel_gain_limit,
-            'dataset_path': str(condition_dir),
-            'num_images': len(images),
-        })
-
-        rows = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            example_dir = tmpdir_path / 'examples'
-            for idx, image_path in enumerate(tqdm(images, desc=run_name)):
-                processed_path = tmpdir_path / image_path.name
-                process_image(
-                    input_path=image_path,
-                    output_path=processed_path,
-                    clip_percent=clip_percent,
-                    preserve_luminance=preserve_luminance,
-                    channel_gain_limit=channel_gain_limit,
-                )
-                niqe = compute_niqe(processed_path)
-                brisque = compute_brisque(processed_path)
-                piqe = compute_piqe(processed_path)
-                rows.append({
-                    'image_name': image_path.name,
-                    'condition': condition,
-                    'method': 'simple_wb',
-                    'clip_percent': clip_percent,
-                    'preserve_luminance': preserve_luminance,
-                    'channel_gain_limit': channel_gain_limit,
-                    'niqe': niqe,
-                    'brisque': brisque,
-                    'piqe': piqe,
-                })
-                if idx < 3:
-                    save_example_artifacts(image_path, processed_path, example_dir)
-
-            df = pd.DataFrame(rows)
-            summary = {
-                'condition': condition,
-                'method': 'simple_wb',
-                'clip_percent': clip_percent,
-                'preserve_luminance': preserve_luminance,
-                'channel_gain_limit': channel_gain_limit,
-                'mean_niqe': float(df['niqe'].mean()),
-                'mean_brisque': float(df['brisque'].mean()),
-                'mean_piqe': float(df['piqe'].mean()),
-                'median_niqe': float(df['niqe'].median()),
-                'median_brisque': float(df['brisque'].median()),
-                'median_piqe': float(df['piqe'].median()),
-            }
-
-            mlflow.log_metrics({
-                'mean_niqe': summary['mean_niqe'],
-                'mean_brisque': summary['mean_brisque'],
-                'mean_piqe': summary['mean_piqe'],
-                'median_niqe': summary['median_niqe'],
-                'median_brisque': summary['median_brisque'],
-                'median_piqe': summary['median_piqe'],
-            })
-
-            per_image_csv = tmpdir_path / 'per_image_metrics.csv'
-            summary_csv = tmpdir_path / 'summary.csv'
-            df.to_csv(per_image_csv, index=False)
-            pd.DataFrame([summary]).to_csv(summary_csv, index=False)
-            mlflow.log_artifact(str(per_image_csv))
-            mlflow.log_artifact(str(summary_csv))
-            if example_dir.exists():
-                mlflow.log_artifacts(str(example_dir), artifact_path='examples')
-
-        return summary
+VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Evaluacion de Simple White Balance por condicion.')
-    parser.add_argument('--dataset_root', type=str, required=True, help='Ruta raiz del dataset test.')
-    parser.add_argument('--mlruns_dir', type=str, default='./mlruns', help='Ruta para almacenamiento MLflow.')
-    parser.add_argument('--experiment_name', type=str, default='simple_wb_experiment')
-    parser.add_argument('--conditions', nargs='*', default=CONDITIONS)
+    parser = argparse.ArgumentParser(description="Evaluación de Simple WB con MLflow")
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        required=True,
+        help="Ruta raíz del dataset. Debe contener carpetas por condición.",
+    )
+    parser.add_argument(
+        "--mlruns_dir",
+        type=str,
+        required=True,
+        help="Ruta donde MLflow almacenará los runs.",
+    )
+    parser.add_argument(
+        "--experiment_name",
+        type=str,
+        default="simple_wb_experiment",
+        help="Nombre del experimento en MLflow.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="outputs",
+        help="Directorio donde se guardan CSVs y previews.",
+    )
     return parser.parse_args()
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def list_condition_dirs(dataset_root: Path) -> List[Path]:
+    return sorted([p for p in dataset_root.iterdir() if p.is_dir()])
+
+
+def list_images(condition_dir: Path) -> List[Path]:
+    return sorted(
+        [
+            p for p in condition_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
+        ]
+    )
+
+
+def compute_metrics(image_bgr) -> Dict[str, float]:
+    return {
+        "niqe": float(compute_niqe(image_bgr)),
+        "brisque": float(compute_brisque(image_bgr)),
+        "piqe": float(compute_piqe(image_bgr)),
+    }
+
+
+def save_preview_examples(
+    original_bgr,
+    processed_bgr,
+    save_dir: Path,
+    stem: str,
+) -> None:
+    ensure_dir(save_dir)
+    cv2.imwrite(str(save_dir / f"{stem}_original.png"), original_bgr)
+    cv2.imwrite(str(save_dir / f"{stem}_processed.png"), processed_bgr)
 
 
 def main() -> None:
     args = parse_args()
+
     dataset_root = Path(args.dataset_root)
     mlruns_dir = Path(args.mlruns_dir)
-    mlruns_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir)
 
-    os.environ['MLFLOW_TRACKING_URI'] = f'file:{mlruns_dir.resolve()}'
-    mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
+    ensure_dir(output_dir)
+    ensure_dir(mlruns_dir)
 
-    grid = list(itertools.product([0, 1, 2, 5], [True, False], [1.2, 1.5, 2.0]))
-    all_summaries = []
-    for condition in args.conditions:
+    mlflow.set_tracking_uri(f"file:{mlruns_dir.resolve()}")
+    mlflow.set_experiment(args.experiment_name)
+
+    if not dataset_root.exists():
+        raise FileNotFoundError(f"No existe dataset_root: {dataset_root}")
+
+    condition_dirs = list_condition_dirs(dataset_root)
+    if not condition_dirs:
+        raise FileNotFoundError(f"No se encontraron carpetas de condición en: {dataset_root}")
+
+    clip_values = [0, 1, 2, 5]
+    preserve_values = [True, False]
+    gain_values = [1.2, 1.5, 2.0]
+
+    all_run_rows = []
+
+    for condition_dir in condition_dirs:
+        condition_name = condition_dir.name
+        image_paths = list_images(condition_dir)
+
+        if not image_paths:
+            print(f"[WARN] Sin imágenes en condición: {condition_name}")
+            continue
+
+        grid = list(itertools.product(clip_values, preserve_values, gain_values))
+
         for clip_percent, preserve_luminance, channel_gain_limit in grid:
-            summary = run_condition(
-                dataset_root=dataset_root,
-                condition=condition,
-                clip_percent=clip_percent,
-                preserve_luminance=preserve_luminance,
-                channel_gain_limit=channel_gain_limit,
-                experiment_name=args.experiment_name,
+            run_name = (
+                f"{condition_name}__simple_wb__"
+                f"clip_{clip_percent}__"
+                f"pl_{str(preserve_luminance).lower()}__"
+                f"cgl_{channel_gain_limit}"
             )
-            all_summaries.append(summary)
 
-    summary_df = pd.DataFrame(all_summaries)
-    summary_df['rank_sum'] = (
-        summary_df.groupby('condition')['mean_niqe'].rank(method='min') +
-        summary_df.groupby('condition')['mean_brisque'].rank(method='min') +
-        summary_df.groupby('condition')['mean_piqe'].rank(method='min')
+            per_image_rows = []
+            preview_saved = False
+
+            with mlflow.start_run(run_name=run_name):
+                mlflow.log_param("condition", condition_name)
+                mlflow.log_param("technique", "white_balance")
+                mlflow.log_param("method", "simple_wb")
+                mlflow.log_param("clip_percent", clip_percent)
+                mlflow.log_param("preserve_luminance", preserve_luminance)
+                mlflow.log_param("channel_gain_limit", channel_gain_limit)
+                mlflow.log_param("dataset_path", str(condition_dir))
+                mlflow.log_param("num_images", len(image_paths))
+
+                for img_path in image_paths:
+                    img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+                    if img_bgr is None:
+                        print(f"[WARN] No se pudo leer: {img_path}")
+                        continue
+
+                    processed_bgr = apply_simple_wb(
+                        image_bgr=img_bgr,
+                        clip_percent=clip_percent,
+                        preserve_luminance=preserve_luminance,
+                        channel_gain_limit=channel_gain_limit,
+                    )
+
+                    metrics = compute_metrics(processed_bgr)
+
+                    row = {
+                        "condition": condition_name,
+                        "image_name": img_path.name,
+                        "method": "simple_wb",
+                        "clip_percent": clip_percent,
+                        "preserve_luminance": preserve_luminance,
+                        "channel_gain_limit": channel_gain_limit,
+                        "niqe": metrics["niqe"],
+                        "brisque": metrics["brisque"],
+                        "piqe": metrics["piqe"],
+                    }
+                    per_image_rows.append(row)
+
+                    if not preview_saved:
+                        preview_dir = output_dir / "previews" / run_name
+                        save_preview_examples(
+                            original_bgr=img_bgr,
+                            processed_bgr=processed_bgr,
+                            save_dir=preview_dir,
+                            stem=img_path.stem,
+                        )
+                        preview_saved = True
+
+                if not per_image_rows:
+                    print(f"[WARN] Run vacío: {run_name}")
+                    continue
+
+                per_image_df = pd.DataFrame(per_image_rows)
+
+                summary = {
+                    "condition": condition_name,
+                    "method": "simple_wb",
+                    "clip_percent": clip_percent,
+                    "preserve_luminance": preserve_luminance,
+                    "channel_gain_limit": channel_gain_limit,
+                    "num_images": int(len(per_image_df)),
+                    "mean_niqe": float(per_image_df["niqe"].mean()),
+                    "mean_brisque": float(per_image_df["brisque"].mean()),
+                    "mean_piqe": float(per_image_df["piqe"].mean()),
+                }
+
+                summary["composite_score"] = (
+                    summary["mean_niqe"]
+                    + summary["mean_brisque"]
+                    + summary["mean_piqe"]
+                )
+
+                mlflow.log_metric("mean_niqe", summary["mean_niqe"])
+                mlflow.log_metric("mean_brisque", summary["mean_brisque"])
+                mlflow.log_metric("mean_piqe", summary["mean_piqe"])
+                mlflow.log_metric("composite_score", summary["composite_score"])
+
+                run_output_dir = output_dir / "runs" / run_name
+                ensure_dir(run_output_dir)
+
+                per_image_csv = run_output_dir / "per_image_metrics.csv"
+                summary_csv = run_output_dir / "summary.csv"
+
+                per_image_df.to_csv(per_image_csv, index=False)
+                pd.DataFrame([summary]).to_csv(summary_csv, index=False)
+
+                mlflow.log_artifact(str(per_image_csv))
+                mlflow.log_artifact(str(summary_csv))
+
+                preview_dir = output_dir / "previews" / run_name
+                if preview_dir.exists():
+                    for f in preview_dir.iterdir():
+                        mlflow.log_artifact(str(f), artifact_path="previews")
+
+                all_run_rows.append(summary)
+
+                print(
+                    f"[OK] {run_name} | "
+                    f"NIQE={summary['mean_niqe']:.4f} | "
+                    f"BRISQUE={summary['mean_brisque']:.4f} | "
+                    f"PIQE={summary['mean_piqe']:.4f}"
+                )
+
+    if not all_run_rows:
+        raise RuntimeError("No se generaron resultados.")
+
+    all_runs_df = pd.DataFrame(all_run_rows)
+    all_runs_csv = output_dir / "all_runs_summary.csv"
+    all_runs_df.to_csv(all_runs_csv, index=False)
+
+    best_by_condition = (
+        all_runs_df.sort_values(
+            by=["condition", "composite_score", "mean_niqe", "mean_brisque", "mean_piqe"],
+            ascending=[True, True, True, True, True],
+        )
+        .groupby("condition", as_index=False)
+        .first()
     )
-    best_by_condition = summary_df.sort_values(['condition', 'rank_sum', 'mean_niqe', 'mean_brisque', 'mean_piqe']).groupby('condition').head(1)
 
-    outputs_dir = Path('outputs')
-    outputs_dir.mkdir(exist_ok=True)
-    summary_df.to_csv(outputs_dir / 'all_runs_summary.csv', index=False)
-    best_by_condition.to_csv(outputs_dir / 'best_config_by_condition.csv', index=False)
+    best_csv = output_dir / "best_config_by_condition.csv"
+    best_by_condition.to_csv(best_csv, index=False)
 
-    print('Experimento completado.')
-    print(f'Resumen global: {outputs_dir / "all_runs_summary.csv"}')
-    print(f'Mejor configuracion por condicion: {outputs_dir / "best_config_by_condition.csv"}')
+    print("\n===== RESULTADOS FINALES =====")
+    print(f"Resumen global: {all_runs_csv}")
+    print(f"Mejor configuración por condición: {best_csv}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
