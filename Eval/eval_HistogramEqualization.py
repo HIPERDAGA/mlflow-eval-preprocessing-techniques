@@ -9,15 +9,14 @@ if str(ROOT) not in sys.path:
 
 import argparse
 import itertools
-import tempfile
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import cv2
 import mlflow
 import pandas as pd
 
-from Metrics.brisque_metric import compute_brisque
-from Metrics.niqe_metric import compute_niqe
+from Metrics.brisque_metric import BRISQUEMetric
+from Metrics.niqe_metric import NIQEMetric
 from Metrics.piqe_metric import compute_piqe
 from Preprocessing.HistogramEqualization import apply_histogram_equalization
 
@@ -26,7 +25,9 @@ VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluación de Ecualización de Histograma con MLflow")
+    parser = argparse.ArgumentParser(
+        description="Evaluación de Ecualización de Histograma con MLflow"
+    )
     parser.add_argument(
         "--dataset_root",
         type=str,
@@ -65,7 +66,8 @@ def list_condition_dirs(dataset_root: Path) -> List[Path]:
 def list_images(condition_dir: Path) -> List[Path]:
     return sorted(
         [
-            p for p in condition_dir.iterdir()
+            p
+            for p in condition_dir.iterdir()
             if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
         ]
     )
@@ -82,24 +84,38 @@ def save_preview_examples(
     cv2.imwrite(str(save_dir / f"{stem}_processed.png"), processed_bgr)
 
 
-def compute_metrics_from_bgr(image_bgr) -> Dict[str, float]:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir) / "temp_metric_image.png"
-        ok = cv2.imwrite(str(tmp_path), image_bgr)
-        if not ok:
-            raise IOError("No se pudo guardar la imagen temporal para métricas.")
+def bgr_to_rgb_uint8(image_bgr) -> "cv2.typing.MatLike":
+    if image_bgr is None:
+        raise ValueError("image_bgr es None")
 
-        return {
-            "niqe": float(compute_niqe(tmp_path)),
-            "brisque": float(compute_brisque(tmp_path)),
-            "piqe": float(compute_piqe(tmp_path)),
-        }
+    if not hasattr(image_bgr, "ndim") or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            f"Se esperaba imagen BGR HxWx3, recibido shape={getattr(image_bgr, 'shape', None)}"
+        )
+
+    if image_bgr.dtype != "uint8":
+        image_bgr = image_bgr.astype("uint8")
+
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+
+def compute_metrics_from_bgr(
+    image_bgr,
+    niqe_metric: NIQEMetric,
+    brisque_metric: BRISQUEMetric,
+) -> Dict[str, float]:
+    image_rgb = bgr_to_rgb_uint8(image_bgr)
+
+    return {
+        "niqe": float(niqe_metric.score(image_rgb)),
+        "brisque": float(brisque_metric.score(image_rgb)),
+        "piqe": float(compute_piqe(image_rgb)),
+    }
 
 
 def build_parameter_grid() -> List[Dict]:
     configs: List[Dict] = []
 
-    # Ecualización global: 2 espacios x 2 preserve = 4 configuraciones
     for color_space, preserve_luminance in itertools.product(
         ["ycrcb", "lab"],
         [True, False],
@@ -114,7 +130,6 @@ def build_parameter_grid() -> List[Dict]:
             }
         )
 
-    # CLAHE: 4 clip_limits x 3 tiles x 2 espacios x 2 preserve = 48 configuraciones
     for clip_limit, tile_grid_size, color_space, preserve_luminance in itertools.product(
         [1.0, 2.0, 3.0, 4.0],
         [(4, 4), (8, 8), (16, 16)],
@@ -179,10 +194,15 @@ def main() -> None:
 
     condition_dirs = list_condition_dirs(dataset_root)
     if not condition_dirs:
-        raise FileNotFoundError(f"No se encontraron carpetas de condición en: {dataset_root}")
+        raise FileNotFoundError(
+            f"No se encontraron carpetas de condición en: {dataset_root}"
+        )
 
     parameter_grid = build_parameter_grid()
     all_run_rows = []
+
+    niqe_metric = NIQEMetric()
+    brisque_metric = BRISQUEMetric()
 
     for condition_dir in condition_dirs:
         condition_name = condition_dir.name
@@ -223,7 +243,10 @@ def main() -> None:
                 if clip_limit is not None:
                     mlflow.log_param("clip_limit", clip_limit)
                 if tile_grid_size is not None:
-                    mlflow.log_param("tile_grid_size", f"{tile_grid_size[0]}x{tile_grid_size[1]}")
+                    mlflow.log_param(
+                        "tile_grid_size",
+                        f"{tile_grid_size[0]}x{tile_grid_size[1]}",
+                    )
 
                 for img_path in image_paths:
                     img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
@@ -240,7 +263,11 @@ def main() -> None:
                         tile_grid_size=tile_grid_size if tile_grid_size is not None else (8, 8),
                     )
 
-                    metrics = compute_metrics_from_bgr(processed_bgr)
+                    metrics = compute_metrics_from_bgr(
+                        processed_bgr,
+                        niqe_metric=niqe_metric,
+                        brisque_metric=brisque_metric,
+                    )
 
                     row = {
                         "condition": condition_name,
@@ -249,7 +276,11 @@ def main() -> None:
                         "color_space": color_space,
                         "preserve_luminance": preserve_luminance,
                         "clip_limit": clip_limit,
-                        "tile_grid_size": None if tile_grid_size is None else f"{tile_grid_size[0]}x{tile_grid_size[1]}",
+                        "tile_grid_size": (
+                            None
+                            if tile_grid_size is None
+                            else f"{tile_grid_size[0]}x{tile_grid_size[1]}"
+                        ),
                         "niqe": metrics["niqe"],
                         "brisque": metrics["brisque"],
                         "piqe": metrics["piqe"],
@@ -274,12 +305,15 @@ def main() -> None:
 
                 summary = {
                     "condition": condition_name,
-                    "technique": "histogram_equalization",
                     "method": method,
                     "color_space": color_space,
                     "preserve_luminance": preserve_luminance,
                     "clip_limit": clip_limit,
-                    "tile_grid_size": None if tile_grid_size is None else f"{tile_grid_size[0]}x{tile_grid_size[1]}",
+                    "tile_grid_size": (
+                        None
+                        if tile_grid_size is None
+                        else f"{tile_grid_size[0]}x{tile_grid_size[1]}"
+                    ),
                     "num_images": int(len(per_image_df)),
                     "mean_niqe": float(per_image_df["niqe"].mean()),
                     "mean_brisque": float(per_image_df["brisque"].mean()),
@@ -306,13 +340,13 @@ def main() -> None:
                 per_image_df.to_csv(per_image_csv, index=False)
                 pd.DataFrame([summary]).to_csv(summary_csv, index=False)
 
-                mlflow.log_artifact(str(per_image_csv))
-                mlflow.log_artifact(str(summary_csv))
+                mlflow.log_artifact(str(per_image_csv), artifact_path="tables")
+                mlflow.log_artifact(str(summary_csv), artifact_path="tables")
 
                 preview_dir = output_dir / "previews" / run_name
                 if preview_dir.exists():
-                    for f in preview_dir.iterdir():
-                        mlflow.log_artifact(str(f), artifact_path="previews")
+                    for preview_file in preview_dir.glob("*"):
+                        mlflow.log_artifact(str(preview_file), artifact_path="previews")
 
                 all_run_rows.append(summary)
 
@@ -324,27 +358,20 @@ def main() -> None:
                 )
 
     if not all_run_rows:
-        raise RuntimeError("No se generaron resultados.")
+        raise RuntimeError("No se generaron resultados. Verifica dataset y parámetros.")
 
-    all_runs_df = pd.DataFrame(all_run_rows)
-    all_runs_csv = output_dir / "all_runs_summary.csv"
-    all_runs_df.to_csv(all_runs_csv, index=False)
-
-    best_by_condition = (
-        all_runs_df.sort_values(
-            by=["condition", "composite_score", "mean_niqe", "mean_brisque", "mean_piqe"],
-            ascending=[True, True, True, True, True],
-        )
-        .groupby("condition", as_index=False)
-        .first()
+    final_df = pd.DataFrame(all_run_rows).sort_values(
+        by=["condition", "composite_score"],
+        ascending=[True, True],
     )
 
-    best_csv = output_dir / "best_config_by_condition.csv"
-    best_by_condition.to_csv(best_csv, index=False)
+    ensure_dir(output_dir)
+    final_csv = output_dir / "histogram_equalization_all_runs_summary.csv"
+    final_df.to_csv(final_csv, index=False)
 
-    print("\n===== RESULTADOS FINALES =====")
-    print(f"Resumen global: {all_runs_csv}")
-    print(f"Mejor configuración por condición: {best_csv}")
+    print(f"\nResumen global guardado en: {final_csv}")
+    print("Top configuraciones por condición:")
+    print(final_df.groupby("condition", as_index=False).first().to_string(index=False))
 
 
 if __name__ == "__main__":
