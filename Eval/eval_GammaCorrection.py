@@ -8,6 +8,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 import argparse
+import itertools
 from typing import Dict, List
 
 import cv2
@@ -56,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs="+",
         default=[0.6, 0.8, 1.0, 1.2, 1.4],
-        help="Lista de gammas a evaluar.",
+        help="Valores gamma a evaluar.",
     )
     return parser.parse_args()
 
@@ -119,9 +120,40 @@ def compute_metrics_from_bgr(
     }
 
 
-def format_run_name(condition_name: str, gamma: float) -> str:
+def build_parameter_grid() -> List[Dict]:
+    configs: List[Dict] = []
+
+    for gamma, color_space, preserve_luminance in itertools.product(
+        [0.6, 0.8, 1.0, 1.2, 1.4],
+        ["rgb", "ycrcb", "lab"],
+        [True, False],
+    ):
+        configs.append(
+            {
+                "gamma": gamma,
+                "color_space": color_space,
+                "preserve_luminance": preserve_luminance,
+            }
+        )
+
+    return configs
+
+
+def format_run_name(
+    condition_name: str,
+    gamma: float,
+    color_space: str,
+    preserve_luminance: bool,
+) -> str:
     gamma_tag = str(gamma).replace(".", "_")
-    return f"{condition_name}_gamma_{gamma_tag}"
+    preserve_tag = str(preserve_luminance).lower()
+
+    return (
+        f"{condition_name}_gamma_"
+        f"g_{gamma_tag}_"
+        f"cs_{color_space}_"
+        f"pl_{preserve_tag}"
+    )
 
 
 def main() -> None:
@@ -146,10 +178,9 @@ def main() -> None:
             f"No se encontraron carpetas de condición en: {dataset_root}"
         )
 
-    gamma_values = list(args.gamma_values)
+    parameter_grid = build_parameter_grid()
     all_run_rows = []
 
-    # Reutilizar instancias de métricas
     niqe_metric = NIQEMetric()
     brisque_metric = BRISQUEMetric()
 
@@ -161,8 +192,17 @@ def main() -> None:
             print(f"[WARN] Sin imágenes en condición: {condition_name}")
             continue
 
-        for gamma in gamma_values:
-            run_name = format_run_name(condition_name, gamma)
+        for cfg in parameter_grid:
+            gamma = cfg["gamma"]
+            color_space = cfg["color_space"]
+            preserve_luminance = cfg["preserve_luminance"]
+
+            run_name = format_run_name(
+                condition_name=condition_name,
+                gamma=gamma,
+                color_space=color_space,
+                preserve_luminance=preserve_luminance,
+            )
 
             per_image_rows = []
             preview_saved = False
@@ -171,6 +211,8 @@ def main() -> None:
                 mlflow.log_param("condition", condition_name)
                 mlflow.log_param("technique", "gamma_correction")
                 mlflow.log_param("gamma", gamma)
+                mlflow.log_param("color_space", color_space)
+                mlflow.log_param("preserve_luminance", preserve_luminance)
                 mlflow.log_param("dataset_path", str(condition_dir))
                 mlflow.log_param("num_images", len(image_paths))
 
@@ -183,6 +225,8 @@ def main() -> None:
                     processed_bgr = apply_gamma_correction(
                         image_bgr=img_bgr,
                         gamma=gamma,
+                        color_space=color_space,
+                        preserve_luminance=preserve_luminance,
                     )
 
                     metrics = compute_metrics_from_bgr(
@@ -196,6 +240,8 @@ def main() -> None:
                         "image_name": img_path.name,
                         "method": "gamma_correction",
                         "gamma": gamma,
+                        "color_space": color_space,
+                        "preserve_luminance": preserve_luminance,
                         "niqe": metrics["niqe"],
                         "brisque": metrics["brisque"],
                         "piqe": metrics["piqe"],
@@ -223,13 +269,14 @@ def main() -> None:
                     "condition": condition_name,
                     "method": "gamma_correction",
                     "gamma": gamma,
+                    "color_space": color_space,
+                    "preserve_luminance": preserve_luminance,
                     "num_images": int(len(per_image_df)),
                     "mean_niqe": float(per_image_df["niqe"].mean()),
                     "mean_brisque": float(per_image_df["brisque"].mean()),
                     "mean_piqe": float(per_image_df["piqe"].mean()),
                 }
 
-                # Score compuesto simple: menor es mejor
                 summary["composite_score"] = (
                     summary["mean_niqe"]
                     + summary["mean_brisque"]
@@ -275,7 +322,6 @@ def main() -> None:
         ascending=[True, True, True, True, True],
     )
 
-    ensure_dir(output_dir)
     final_csv = output_dir / "gamma_correction_all_runs_summary.csv"
     final_df.to_csv(final_csv, index=False)
 
