@@ -52,13 +52,6 @@ def parse_args() -> argparse.Namespace:
         default="outputs_gamma_correction",
         help="Directorio donde se guardan CSVs y previews.",
     )
-    parser.add_argument(
-        "--gamma_values",
-        type=float,
-        nargs="+",
-        default=[0.6, 0.8, 1.0, 1.2, 1.4],
-        help="Valores gamma a evaluar.",
-    )
     return parser.parse_args()
 
 
@@ -125,7 +118,7 @@ def build_parameter_grid() -> List[Dict]:
 
     for gamma, color_space, preserve_luminance in itertools.product(
         [0.6, 0.8, 1.0, 1.2, 1.4],
-        ["rgb", "ycrcb", "lab"],
+        ["bgr", "ycrcb", "lab"],
         [True, False],
     ):
         configs.append(
