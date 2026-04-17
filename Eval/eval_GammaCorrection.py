@@ -8,16 +8,14 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 import argparse
-import itertools
-import tempfile
 from typing import Dict, List
 
 import cv2
 import mlflow
 import pandas as pd
 
-from Metrics.brisque_metric import compute_brisque
-from Metrics.niqe_metric import compute_niqe
+from Metrics.brisque_metric import BRISQUEMetric
+from Metrics.niqe_metric import NIQEMetric
 from Metrics.piqe_metric import compute_piqe
 from Preprocessing.GammaCorrection import apply_gamma_correction
 
@@ -26,7 +24,9 @@ VALID_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluación de Ajuste Gamma con MLflow")
+    parser = argparse.ArgumentParser(
+        description="Evaluación de Gamma Correction con MLflow"
+    )
     parser.add_argument(
         "--dataset_root",
         type=str,
@@ -51,6 +51,13 @@ def parse_args() -> argparse.Namespace:
         default="outputs_gamma_correction",
         help="Directorio donde se guardan CSVs y previews.",
     )
+    parser.add_argument(
+        "--gamma_values",
+        type=float,
+        nargs="+",
+        default=[0.6, 0.8, 1.0, 1.2, 1.4],
+        help="Lista de gammas a evaluar.",
+    )
     return parser.parse_args()
 
 
@@ -65,7 +72,8 @@ def list_condition_dirs(dataset_root: Path) -> List[Path]:
 def list_images(condition_dir: Path) -> List[Path]:
     return sorted(
         [
-            p for p in condition_dir.iterdir()
+            p
+            for p in condition_dir.iterdir()
             if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
         ]
     )
@@ -82,52 +90,38 @@ def save_preview_examples(
     cv2.imwrite(str(save_dir / f"{stem}_processed.png"), processed_bgr)
 
 
-def compute_metrics_from_bgr(image_bgr) -> Dict[str, float]:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir) / "temp_metric_image.png"
-        ok = cv2.imwrite(str(tmp_path), image_bgr)
-        if not ok:
-            raise IOError("No se pudo guardar la imagen temporal para métricas.")
+def bgr_to_rgb_uint8(image_bgr):
+    if image_bgr is None:
+        raise ValueError("image_bgr es None")
 
-        return {
-            "niqe": float(compute_niqe(tmp_path)),
-            "brisque": float(compute_brisque(tmp_path)),
-            "piqe": float(compute_piqe(tmp_path)),
-        }
-
-
-def build_parameter_grid() -> List[Dict]:
-    configs: List[Dict] = []
-
-    for gamma, color_space, preserve_luminance in itertools.product(
-        [0.6, 0.8, 1.0, 1.2, 1.5],
-        ["bgr", "ycrcb"],
-        [True, False],
-    ):
-        configs.append(
-            {
-                "gamma": gamma,
-                "color_space": color_space,
-                "preserve_luminance": preserve_luminance,
-            }
+    if not hasattr(image_bgr, "ndim") or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(
+            f"Se esperaba imagen BGR HxWx3, recibido shape={getattr(image_bgr, 'shape', None)}"
         )
 
-    return configs
+    if image_bgr.dtype != "uint8":
+        image_bgr = image_bgr.astype("uint8")
+
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
 
-def format_run_name(
-    condition_name: str,
-    gamma: float,
-    color_space: str,
-    preserve_luminance: bool,
-) -> str:
-    preserve_tag = str(preserve_luminance).lower()
-    return (
-        f"{condition_name}__gamma__"
-        f"g_{gamma}__"
-        f"cs_{color_space}__"
-        f"pl_{preserve_tag}"
-    )
+def compute_metrics_from_bgr(
+    image_bgr,
+    niqe_metric: NIQEMetric,
+    brisque_metric: BRISQUEMetric,
+) -> Dict[str, float]:
+    image_rgb = bgr_to_rgb_uint8(image_bgr)
+
+    return {
+        "niqe": float(niqe_metric.score(image_rgb)),
+        "brisque": float(brisque_metric.score(image_rgb)),
+        "piqe": float(compute_piqe(image_rgb)),
+    }
+
+
+def format_run_name(condition_name: str, gamma: float) -> str:
+    gamma_tag = str(gamma).replace(".", "_")
+    return f"{condition_name}_gamma_{gamma_tag}"
 
 
 def main() -> None:
@@ -148,10 +142,16 @@ def main() -> None:
 
     condition_dirs = list_condition_dirs(dataset_root)
     if not condition_dirs:
-        raise FileNotFoundError(f"No se encontraron carpetas de condición en: {dataset_root}")
+        raise FileNotFoundError(
+            f"No se encontraron carpetas de condición en: {dataset_root}"
+        )
 
-    parameter_grid = build_parameter_grid()
+    gamma_values = list(args.gamma_values)
     all_run_rows = []
+
+    # Reutilizar instancias de métricas
+    niqe_metric = NIQEMetric()
+    brisque_metric = BRISQUEMetric()
 
     for condition_dir in condition_dirs:
         condition_name = condition_dir.name
@@ -161,17 +161,8 @@ def main() -> None:
             print(f"[WARN] Sin imágenes en condición: {condition_name}")
             continue
 
-        for cfg in parameter_grid:
-            gamma = cfg["gamma"]
-            color_space = cfg["color_space"]
-            preserve_luminance = cfg["preserve_luminance"]
-
-            run_name = format_run_name(
-                condition_name=condition_name,
-                gamma=gamma,
-                color_space=color_space,
-                preserve_luminance=preserve_luminance,
-            )
+        for gamma in gamma_values:
+            run_name = format_run_name(condition_name, gamma)
 
             per_image_rows = []
             preview_saved = False
@@ -179,10 +170,7 @@ def main() -> None:
             with mlflow.start_run(run_name=run_name):
                 mlflow.log_param("condition", condition_name)
                 mlflow.log_param("technique", "gamma_correction")
-                mlflow.log_param("method", "gamma")
                 mlflow.log_param("gamma", gamma)
-                mlflow.log_param("color_space", color_space)
-                mlflow.log_param("preserve_luminance", preserve_luminance)
                 mlflow.log_param("dataset_path", str(condition_dir))
                 mlflow.log_param("num_images", len(image_paths))
 
@@ -195,19 +183,19 @@ def main() -> None:
                     processed_bgr = apply_gamma_correction(
                         image_bgr=img_bgr,
                         gamma=gamma,
-                        color_space=color_space,
-                        preserve_luminance=preserve_luminance,
                     )
 
-                    metrics = compute_metrics_from_bgr(processed_bgr)
+                    metrics = compute_metrics_from_bgr(
+                        processed_bgr,
+                        niqe_metric=niqe_metric,
+                        brisque_metric=brisque_metric,
+                    )
 
                     row = {
                         "condition": condition_name,
                         "image_name": img_path.name,
-                        "method": "gamma",
+                        "method": "gamma_correction",
                         "gamma": gamma,
-                        "color_space": color_space,
-                        "preserve_luminance": preserve_luminance,
                         "niqe": metrics["niqe"],
                         "brisque": metrics["brisque"],
                         "piqe": metrics["piqe"],
@@ -226,23 +214,22 @@ def main() -> None:
 
                 if not per_image_rows:
                     print(f"[WARN] Run vacío: {run_name}")
+                    mlflow.end_run(status="FAILED")
                     continue
 
                 per_image_df = pd.DataFrame(per_image_rows)
 
                 summary = {
                     "condition": condition_name,
-                    "technique": "gamma_correction",
-                    "method": "gamma",
+                    "method": "gamma_correction",
                     "gamma": gamma,
-                    "color_space": color_space,
-                    "preserve_luminance": preserve_luminance,
                     "num_images": int(len(per_image_df)),
                     "mean_niqe": float(per_image_df["niqe"].mean()),
                     "mean_brisque": float(per_image_df["brisque"].mean()),
                     "mean_piqe": float(per_image_df["piqe"].mean()),
                 }
 
+                # Score compuesto simple: menor es mejor
                 summary["composite_score"] = (
                     summary["mean_niqe"]
                     + summary["mean_brisque"]
@@ -263,13 +250,13 @@ def main() -> None:
                 per_image_df.to_csv(per_image_csv, index=False)
                 pd.DataFrame([summary]).to_csv(summary_csv, index=False)
 
-                mlflow.log_artifact(str(per_image_csv))
-                mlflow.log_artifact(str(summary_csv))
+                mlflow.log_artifact(str(per_image_csv), artifact_path="tables")
+                mlflow.log_artifact(str(summary_csv), artifact_path="tables")
 
                 preview_dir = output_dir / "previews" / run_name
                 if preview_dir.exists():
-                    for f in preview_dir.iterdir():
-                        mlflow.log_artifact(str(f), artifact_path="previews")
+                    for preview_file in preview_dir.glob("*"):
+                        mlflow.log_artifact(str(preview_file), artifact_path="previews")
 
                 all_run_rows.append(summary)
 
@@ -281,27 +268,29 @@ def main() -> None:
                 )
 
     if not all_run_rows:
-        raise RuntimeError("No se generaron resultados.")
+        raise RuntimeError("No se generaron resultados. Verifica dataset y parámetros.")
 
-    all_runs_df = pd.DataFrame(all_run_rows)
-    all_runs_csv = output_dir / "all_runs_summary.csv"
-    all_runs_df.to_csv(all_runs_csv, index=False)
-
-    best_by_condition = (
-        all_runs_df.sort_values(
-            by=["condition", "composite_score", "mean_niqe", "mean_brisque", "mean_piqe"],
-            ascending=[True, True, True, True, True],
-        )
-        .groupby("condition", as_index=False)
-        .first()
+    final_df = pd.DataFrame(all_run_rows).sort_values(
+        by=["condition", "composite_score", "mean_niqe", "mean_brisque", "mean_piqe"],
+        ascending=[True, True, True, True, True],
     )
 
-    best_csv = output_dir / "best_config_by_condition.csv"
+    ensure_dir(output_dir)
+    final_csv = output_dir / "gamma_correction_all_runs_summary.csv"
+    final_df.to_csv(final_csv, index=False)
+
+    best_by_condition = (
+        final_df.groupby("condition", as_index=False)
+        .first()
+        .sort_values(by="condition", ascending=True)
+    )
+    best_csv = output_dir / "best_gamma_by_condition.csv"
     best_by_condition.to_csv(best_csv, index=False)
 
-    print("\n===== RESULTADOS FINALES =====")
-    print(f"Resumen global: {all_runs_csv}")
+    print(f"\nResumen global guardado en: {final_csv}")
     print(f"Mejor configuración por condición: {best_csv}")
+    print("\nTop configuraciones por condición:")
+    print(best_by_condition.to_string(index=False))
 
 
 if __name__ == "__main__":
